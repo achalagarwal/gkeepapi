@@ -1061,6 +1061,11 @@ class Keep(object):
                 if 'parentId' in raw_node:
                     # If the parentId field is set, this is an update. Load it
                     # into the existing node.
+                    # basically if it has a parent that means that it is still there in the keep
+                    # other wise, a deleted note has no parent but it still comes up in the update
+                    # ofcourse!
+
+                    # TODO is this node.load a brute force copy paste?
                     node.load(raw_node)
                     self._sid_map[node.server_id] = node.id
                     logger.debug('Updated node: %s', raw_node['id'])
