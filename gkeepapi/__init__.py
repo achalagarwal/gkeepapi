@@ -22,6 +22,114 @@ from . import exception
 
 logger = logging.getLogger(__name__)
 
+def has_attr_value(obj, attr='', val=''):
+    try:
+        return getattr(obj, attr) == val
+    except(AttributeError):
+        return False
+
+def get_task_id(keep_id):
+    proc = subprocess.Popen(['task',keep_id ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+    stdout_value = proc.communicate()
+
+    # extract task id from stdout output 
+    string = stdout_value[0].decode('ascii')
+    return re.findall('\d+', string)[0] if string else None
+    # an alternate way would be to split the lines
+    # task_details = string.split('\n')[3]
+
+def convert_to_task(node):
+
+    # create base structure
+    task = {'text': node.text,
+            'keep_id':node.id,
+            'children': node._subitems,
+            'created':node.timestamps._created,
+            
+            # only records parents for sublist items
+            # as a guide, this should be None anytime its parent is irrelevant to Task Warrior
+
+            'parent': node.parent_id if type(node.parent_item) is _node.ListItem else None
+            }
+    
+    # populate with children
+    task['children'] = list(map(
+                            lambda x: convert_to_task(x), 
+                            filter(lambda x: has_attr_value(x, 'checked', False),
+                            task.get('children', []).values())))
+
+    return task
+
+# if a new child is added, its parents are not known
+# it is possible that the parent has not been added in taskwarrior
+# but we will get over that by making sure that the parents are added first
+# however, we need to make sure about one thing, and that is that 
+# when the child is added without context information about its parents, we would like to 
+# make sure that its parents are conveyed about a new dependency in taskwarrior
+# so add to taskwarrior already takes care of that if the parent is provided
+# however if the parent isnt provided, how do we make sure that parent is known
+# we can store the parent task id, this could go haywire, we need to save keep_id
+
+
+def add_to_taskwarrior(task, project='Google Keep'):
+
+    # ensure that the task has not been added yet
+    assert(task.get('task_id', None) == None)
+    # add task in taskwarrior
+    proc = subprocess.Popen(['task', 'add', task['text'] ], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    stdout_value = proc.communicate()
+
+    # extract taskwarrior id from stdout
+    string = stdout_value[0].decode('ascii')
+    task_id = re.findall(r'\d+', string )[0]
+    task['task_id'] = task_id
+
+    # now we annotate the google keep task id
+    subprocess.Popen(['task', task['task_id'], 'annotate', task['keep_id']]).communicate()
+
+    # add as a dependent to parent
+    if task['parent']:
+        proc = subprocess.Popen(['task', get_task_id(task['parent']), 'modify', 'depends:'+task['task_id'] ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+        stdout_value = proc.communicate()
+
+    # iterate for all children
+    for child in task['children']:
+        add_to_taskwarrior(child, parent=task['task_id'], project=project)
+
+delete_from_taskwarrior = lambda node: _delete_from_taskwarrior(get_task_id(node['keep_id']))
+
+def _delete_from_taskwarrior(tasks):
+
+    if not tasks:
+        return True
+    # create arguments depending on whether tasks is a single number or a list of numbers
+    # TODO Should we enforce string input here?
+    task_string, confirm_string, count = (','.join([str(task) if task else '' for task in tasks]), 'all \n', len(tasks)) if hasattr(tasks, '__iter__') else (str(tasks), 'yes \n', 1)
+
+    # delete tasks from taskwarrior
+    proc = subprocess.Popen(['task', task_string, 'delete' ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+
+    # confirm deletion of all tasks provided
+    stdout_value = proc.communicate(bytes(confirm_string, 'ascii'))
+    string = stdout_value[0].decode('ascii')
+    return True if re.findall(rf'Deleted {count}+ task.', string) else False
+        
+def perform_incremental_update(node):
+
+    # assume that this is already there in taskwarrior
+    assert(get_task_id(node.keep_id))
+
+    # if this node is checked, we delete
+    if node._checked == True:
+        delete_from_taskwarrior(node)
+        return
+    
+    # TODO Assumption below is not always true
+    # otherwise we let it be because its text will not change
+    
+    # its children has changed and that can be handled at the child level
+    
+
 try:
     Pattern = re._pattern_type # pylint: disable=protected-access
 except AttributeError:
@@ -1050,7 +1158,7 @@ class Keep(object):
         created_nodes = []
         deleted_nodes = []
         listitem_nodes = []
-
+        updated_nodes = []
         # Loop over each updated node.
         for raw_node in raw:
             # If the id exists, then we already know about it. In other words,
@@ -1065,10 +1173,11 @@ class Keep(object):
                     # other wise, a deleted note has no parent but it still comes up in the update
                     # ofcourse!
 
-                    # TODO is this node.load a brute force copy paste?
+                    # this is just setting the dirty flag
                     node.load(raw_node)
                     self._sid_map[node.server_id] = node.id
                     logger.debug('Updated node: %s', raw_node['id'])
+                    updated_nodes.append(node)
                 else:
                     # Otherwise, this node has been deleted. Add it to the list.
                     deleted_nodes.append(node)
@@ -1112,6 +1221,18 @@ class Keep(object):
             parent_node = self._nodes.get(node.parent_id)
             parent_node.append(node, False)
 
+        # batch add nodes
+        _helper = lambda x: has_attr_value(x, 'title','Significant + Urgent') and has_attr_value(x, 'pinned', True)
+        created_nodes = list(filter(
+            lambda x: ((has_attr_value(x, 'checked', False) 
+            and _helper(getattr(getattr(x,'parent', {}),'parent',None)))
+             or _helper(getattr(x,'parent', {}))), created_nodes))
+
+        map(lambda x: add_to_taskwarrior(convert_to_task(x)), 
+            sorted(created_nodes, 
+                key=lambda x: len(x._subitems.keys())))
+        
+
         # Detach deleted nodes from the tree.
         for node in deleted_nodes:
             node.parent.remove(node)
@@ -1120,6 +1241,15 @@ class Keep(object):
                 del self._sid_map[node.server_id]
             logger.debug('Deleted node: %s', node.id)
 
+        # batch delete nodes in taskwarrior
+        _delete_from_taskwarrior(list(map(lambda x: get_task_id(x.id) , deleted_nodes)))
+
+        # Perform incremental updates on the nodes that have been added 
+        for node in updated_nodes:
+            # I want to extract the information here!
+            # I don't want to iterate to update
+            update_in_taskwarrior(node)
+        
         # Hydrate label references in notes.
         for node in self.all():
             for label_id in node.labels._labels: # pylint: disable=protected-access
