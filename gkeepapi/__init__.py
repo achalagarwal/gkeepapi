@@ -10,9 +10,9 @@ import re
 import time
 import random
 import json
-
+from functools import reduce
 from uuid import getnode as get_mac
-
+import subprocess
 import six
 import gpsoauth
 import requests
@@ -20,7 +20,10 @@ import requests
 from . import node as _node
 from . import exception
 
+logging.basicConfig(filename='keep_to_task_logs.log', filemode='w+', level=logging.INFO)
+# logger = logging.Logger("keep_to_task_logs")
 logger = logging.getLogger(__name__)
+
 
 def has_attr_value(obj, attr='', val=''):
     try:
@@ -28,17 +31,30 @@ def has_attr_value(obj, attr='', val=''):
     except(AttributeError):
         return False
 
-def get_task_id(keep_id):
+def get_task_id(keep_id, perma=True):
+
+    logging.info("Getting temporary task id for keep id {}".format(keep_id))
+
     proc = subprocess.Popen(['task',keep_id ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
     stdout_value = proc.communicate()
 
     # extract task id from stdout output 
     string = stdout_value[0].decode('ascii')
-    return re.findall('\d+', string)[0] if string else None
+
+    temp_task_id = re.findall('\d+', string)[0] if string else None
+
+    logging.info("Task id: {}".format(temp_task_id))
+
+
+    return _get_perma_task_id(temp_task_id) if perma else temp_task_id
+
     # an alternate way would be to split the lines
     # task_details = string.split('\n')[3]
 
 def convert_to_task(node):
+
+    logging.info("Creating task and node for {} with attrs {}".format(str(node), str(node.__dict__)))
+
 
     # create base structure
     task = {'text': node.text,
@@ -58,6 +74,8 @@ def convert_to_task(node):
                             filter(lambda x: has_attr_value(x, 'checked', False),
                             task.get('children', []).values())))
 
+    logging.info("Task created: {}".format(task))
+
     return task
 
 # if a new child is added, its parents are not known
@@ -70,35 +88,96 @@ def convert_to_task(node):
 # however if the parent isnt provided, how do we make sure that parent is known
 # we can store the parent task id, this could go haywire, we need to save keep_id
 
+def exists_in_task(node):
 
-def add_to_taskwarrior(task, project='Google Keep'):
+    return not (get_task_id(node.id) == None)
 
+def _get_perma_task_id(task_id, perma=True):
+
+    if not task_id:
+        return None
+
+    logging.info("Getting taskwarrior uuid for temporary task id: {}".format(task_id))
+
+    proc = subprocess.Popen(['task', str(task_id), 'info'],stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    stdout_value = proc.communicate()
+    string = stdout_value[0].decode('ascii')
+    regex = 'UUID\s*'
+    return re.split(regex, 
+            list(filter(lambda x: 
+            re.findall(regex, x), 
+            string.split('\n'))
+            )[0])[1].split('-')[0]
+
+def add_to_taskwarrior(node):
+
+    if exists_in_task(node):
+        logging.info('Cannot add existing task to taskwarrior\
+         as task with keep id: {} already exists'.format(node.id))
+        return
+    task = convert_to_task(node)
+    logging.info("Adding new task to taskwarrior with keep id: {}".format(task['keep_id']))
+
+    _add_task_to_taskwarrior(task)
+
+def _add_task_to_taskwarrior(task):
+    
+    logging.info("Adding task to taskwarrior")
     # ensure that the task has not been added yet
     assert(task.get('task_id', None) == None)
     # add task in taskwarrior
     proc = subprocess.Popen(['task', 'add', task['text'] ], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
     stdout_value = proc.communicate()
-
+    
     # extract taskwarrior id from stdout
     string = stdout_value[0].decode('ascii')
     task_id = re.findall(r'\d+', string )[0]
-    task['task_id'] = task_id
 
+    logging.info("New task added with id: {}".format(task_id))
+
+    # get permanent id from the temporary task_id
+
+    task['task_id'] = _get_perma_task_id(task_id)
+    
     # now we annotate the google keep task id
     subprocess.Popen(['task', task['task_id'], 'annotate', task['keep_id']]).communicate()
 
     # add as a dependent to parent
     if task['parent']:
-        proc = subprocess.Popen(['task', get_task_id(task['parent']), 'modify', 'depends:'+task['task_id'] ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+        proc = subprocess.Popen(['task', get_task_id(task['parent'], perma=True), 
+                'modify', 'depends:'+ task_id ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
         stdout_value = proc.communicate()
 
     # iterate for all children
     for child in task['children']:
-        add_to_taskwarrior(child, parent=task['task_id'], project=project)
+        _add_task_to_taskwarrior(child)
+    
+def delete_from_taskwarrior(node):
 
-delete_from_taskwarrior = lambda node: _delete_from_taskwarrior(get_task_id(node['keep_id']))
+    logging.info("Deleting Node from taskwarrior with keep_id: {}".format(node['id']))
 
+    # always working with one node at a time
+    # this is because list of UUIDs dont work with task delete command
+    task_id = get_task_id(node['id'], perma=True)
+    confirm_string = 'yes \n'
+    count = 1
+    # create arguments depending on whether tasks is a single number or a list of numbers
+    # TODO Should we enforce string input here?
+
+    # delete tasks from taskwarrior
+    proc = subprocess.Popen(['task', task_id, 'delete' ], stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+
+    # confirm deletion of all tasks provided
+    stdout_value = proc.communicate(bytes(confirm_string, 'ascii'))
+    string = stdout_value[0].decode('ascii')
+    return True if re.findall(rf'Deleted {count}+ task.', string) else False
+        
+@DeprecationWarning
 def _delete_from_taskwarrior(tasks):
+
+    logging.info("Calling a deprecated and potentially hazardous function")
+
+    return
 
     if not tasks:
         return True
@@ -114,13 +193,19 @@ def _delete_from_taskwarrior(tasks):
     string = stdout_value[0].decode('ascii')
     return True if re.findall(rf'Deleted {count}+ task.', string) else False
         
-def perform_incremental_update(node):
+def update_in_taskwarrior(node):
 
-    # assume that this is already there in taskwarrior
-    assert(get_task_id(node.keep_id))
+    if not exists_in_task(node):
+        return 
+
+    # no need to assume that this is already there in taskwarrior
+    # assert(get_task_id(node.keep_id))
 
     # if this node is checked, we delete
     if node._checked == True:
+        # deleting as completed has a different pragmatics in my flow
+        logging.info("Deleting node with keep_id: {} as it has been checked off".format(node['id']))
+
         delete_from_taskwarrior(node)
         return
     
@@ -341,7 +426,7 @@ class API(object):
                 raise exception.APIException(error['code'], error)
 
             # Otherwise, try requesting a new OAuth token.
-            logger.info('Refreshing access token')
+            logging.info('Refreshing access token')
             self._auth.refresh()
             i += 1
 
@@ -1228,7 +1313,7 @@ class Keep(object):
             and _helper(getattr(getattr(x,'parent', {}),'parent',None)))
              or _helper(getattr(x,'parent', {}))), created_nodes))
 
-        map(lambda x: add_to_taskwarrior(convert_to_task(x)), 
+        map(lambda x: add_to_taskwarrior(x), 
             sorted(created_nodes, 
                 key=lambda x: len(x._subitems.keys())))
         
@@ -1241,8 +1326,11 @@ class Keep(object):
                 del self._sid_map[node.server_id]
             logger.debug('Deleted node: %s', node.id)
 
-        # batch delete nodes in taskwarrior
-        _delete_from_taskwarrior(list(map(lambda x: get_task_id(x.id) , deleted_nodes)))
+        # delete nodes in taskwarrior
+        reduce(lambda acc,y: acc + delete_from_taskwarrior(y), 
+            filter(lambda x: exists_in_task(x), deleted_nodes), 0)
+
+        
 
         # Perform incremental updates on the nodes that have been added 
         for node in updated_nodes:
@@ -1315,3 +1403,4 @@ class Keep(object):
             if node_id in self._nodes:
                 continue
             logger.error('Unregistered node: %s', node_id)
+
